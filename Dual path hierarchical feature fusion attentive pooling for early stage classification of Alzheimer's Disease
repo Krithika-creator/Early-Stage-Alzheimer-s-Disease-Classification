@@ -1,0 +1,302 @@
+import os, random
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (Conv2D, BatchNormalization, MaxPooling2D,
+                                     Dropout, GlobalAveragePooling2D, Dense,
+                                     concatenate, Input, Reshape, Activation,
+                                     Multiply, Add, GlobalMaxPooling2D)
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.regularizers import l2
+import tensorflow as tf
+from PIL import Image
+def load_2d_image_data(data_path):
+    X, y = [], []
+    for class_idx, class_name in enumerate(CLASSES):
+        class_path = os.path.join(data_path, class_name)
+        for file in os.listdir(class_path):
+            if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                img = Image.open(os.path.join(class_path, file)).convert("L")
+                img = img.resize(IMG_SIZE, Image.BILINEAR)
+                img = np.array(img).astype(np.float32) / 255.0
+                X.append(np.expand_dims(img, axis=-1))
+                y.append(class_idx)
+    return np.array(X), np.array(y)
+class ImageDataGeneratorCustom:
+    def __init__(self, rotation_range=15, zoom_range=0.2, horizontal_flip=True):
+        self.rotation_range = rotation_range
+        self.zoom_range = zoom_range
+        self.horizontal_flip = horizontal_flip
+
+    def random_transform(self, img):
+        img = Image.fromarray((img.squeeze() * 255).astype(np.uint8))
+
+        if self.horizontal_flip and random.random() > 0.5:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+
+        if self.rotation_range > 0:
+            angle = random.uniform(-self.rotation_range, self.rotation_range)
+            img = img.rotate(angle, resample=Image.BILINEAR)
+
+        if self.zoom_range > 0:
+            zoom_factor = random.uniform(1 - self.zoom_range, 1 + self.zoom_range)
+            w, h = img.size
+            new_size = (int(w * zoom_factor), int(h * zoom_factor))
+            img_zoomed = img.resize(new_size, Image.BILINEAR)
+
+            # Center crop or pad back to original size
+            if zoom_factor > 1:
+                # Crop center
+                left = (new_size[0] - w) // 2
+                top = (new_size[1] - h) // 2
+                img = img_zoomed.crop((left, top, left + w, top + h))
+            else:
+                # Pad
+                result = Image.new("L", (w, h))
+                left = (w - new_size[0]) // 2
+                top = (h - new_size[1]) // 2
+                result.paste(img_zoomed, (left, top))
+                img = result
+
+        img = np.array(img).astype(np.float32) / 255.0
+        return np.expand_dims(img, axis=-1)
+   def flow(self, X, y, batch_size=16):
+        while True:
+            idx = np.random.choice(len(X), batch_size)
+            batch_X = np.array([self.random_transform(x) for x in X[idx]])
+            batch_y = y[idx]
+            yield batch_X, batch_y
+IMG_SIZE = (128, 128)
+CLASSES = ['AD','MCI','EMCI','LMCI']  # Change as needed
+DATA_PATH = r"D:\krithika\new research 3\ODE\extracted Female and Male 55 to 77"
+K_FOLDS = 5
+BATCH_SIZE = 16
+EPOCHS = 10
+def squeeze_excite_block_2d(input_tensor, ratio=16):
+    channels = input_tensor.shape[-1]
+    se = GlobalAveragePooling2D()(input_tensor)
+    se = Reshape((1, 1, channels))(se)
+    se = Dense(channels // ratio, activation='relu')(se)
+    se = Dense(channels, activation='sigmoid')(se)
+    return Multiply()([input_tensor, se])
+# === Residual Block (2D) ===
+def residual_block_2d(x, filters, kernel_size=3, strides=1, use_se=True):
+    shortcut = x
+    x = Conv2D(filters, kernel_size, padding='same', strides=strides,
+               kernel_initializer='he_normal', kernel_regularizer=l2(1e-4))(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Conv2D(filters, kernel_size, padding='same',
+               kernel_initializer='he_normal', kernel_regularizer=l2(1e-4))(x)
+    x = BatchNormalization()(x)
+    if use_se:
+        x = squeeze_excite_block_2d(x)
+    if strides != 1 or shortcut.shape[-1] != filters:
+        shortcut = Conv2D(filters, 1, strides=strides,
+                          kernel_initializer='he_normal', kernel_regularizer=l2(1e-4))(shortcut)
+        shortcut = BatchNormalization()(shortcut)
+    x = Add()([x, shortcut])
+    x = Activation('relu')(x)
+    return x
+# === Model Architecture ===
+def create_2d_model(input_shape, num_classes):
+    inputs = Input(shape=input_shape)
+    x = Conv2D(32, 3, activation='relu', padding='same')(inputs)
+    x = BatchNormalization()(x)
+    path1 = residual_block_2d(x, 32)
+    path1 = residual_block_2d(path1, 32)
+    path1 = MaxPooling2D()(path1)
+    path1 = Dropout(0.2)(path1)
+    path2 = Conv2D(32, 3, dilation_rate=2, padding='same', activation='relu')(x)
+    path2 = BatchNormalization()(path2)
+    path2 = Conv2D(32, 3, dilation_rate=2, padding='same', activation='relu')(path2)
+    path2 = BatchNormalization()(path2)
+    path2 = MaxPooling2D()(path2)
+    path2 = Dropout(0.2)(path2)
+    x = concatenate([path1, path2])
+    x = residual_block_2d(x, 64, strides=2)
+    x = residual_block_2d(x, 64)
+    x = Dropout(0.3)(x)
+    x = residual_block_2d(x, 128, strides=2)
+    x = residual_block_2d(x, 128)
+    x = Dropout(0.4)(x)
+    x = residual_block_2d(x, 256, strides=2)
+    x = residual_block_2d(x, 256)
+    gap = GlobalAveragePooling2D()(x)
+    gmp = GlobalMaxPooling2D()(x)
+    x = concatenate([gap, gmp])
+    x = Dense(512, activation='relu')(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.5)(x)
+    outputs = Dense(num_classes, activation='softmax')(x)
+    model = Model(inputs=inputs, outputs=outputs)
+    model.compile(optimizer=Adam(learning_rate=0.0001),
+                  loss='categorical_crossentropy',
+                  metrics=['accuracy', tf.keras.metrics.TopKCategoricalAccuracy(k=3, name='top3_acc')])
+# === K-Fold ===
+def run_kfold_2d_classification():
+    X, y = load_2d_image_data(DATA_PATH)
+    y_cat = to_categorical(y, num_classes=len(CLASSES))
+    skf = StratifiedKFold(n_splits=K_FOLDS, shuffle=True, random_state=42)
+    all_y_true, all_y_pred = [], []
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y), 1):
+        print(f"\n=== Fold {fold}/{K_FOLDS} ===")
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_train, y_val = y_cat[train_idx], y_cat[val_idx]
+        datagen = ImageDataGeneratorCustom()
+        model = create_2d_model(input_shape=(*IMG_SIZE, 1), num_classes=len(CLASSES))
+        history = model.fit(datagen.flow(X_train, y_train, batch_size=BATCH_SIZE),
+                            steps_per_epoch=len(X_train) // BATCH_SIZE,
+                            validation_data=(X_val, y_val),
+                            epochs=EPOCHS,
+                            callbacks=[
+                                EarlyStopping(patience=10, restore_best_weights=True),
+                                ReduceLROnPlateau(patience=5)
+                            ],
+                            verbose=1)
+        y_pred = model.predict(X_val)
+        all_y_true.append(y_val)
+        all_y_pred.append(y_pred)
+        # plot_metrics(history)
+        cm = confusion_matrix(np.argmax(y_val, axis=1), np.argmax(y_pred, axis=1))
+        # plot_confusion_matrix(cm, CLASSES)
+    y_true = np.concatenate(all_y_true)
+    y_pred = np.concatenate(all_y_pred)
+    print("\n=== Final Classification Report ===")
+    print(classification_report(np.argmax(y_true, axis=1), np.argmax(y_pred, axis=1), target_names=CLASSES))
+if __name__ == "__main__":
+    run_kfold_2d_classification()  
+    === Fold 1/5 ===
+    Epoch 1/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4400s[0m 1s/step - accuracy: 0.3843 - loss: 2.0293 - top3_acc: 0.8421 - val_accuracy: 0.5776 - val_loss: 1.5230 - val_top3_acc: 0.9328 - learning_rate: 1.0000e-04
+    Epoch 2/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4124s[0m 950ms/step - accuracy: 0.5584 - loss: 1.5286 - top3_acc: 0.9379 - val_accuracy: 0.6538 - val_loss: 1.2830 - val_top3_acc: 0.9677 - learning_rate: 1.0000e-04
+    Epoch 3/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4062s[0m 936ms/step - accuracy: 0.6335 - loss: 1.3145 - top3_acc: 0.9626 - val_accuracy: 0.7219 - val_loss: 1.1126 - val_top3_acc: 0.9764 - learning_rate: 1.0000e-04
+    Epoch 4/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4072s[0m 938ms/step - accuracy: 0.7252 - loss: 1.1098 - top3_acc: 0.9758 - val_accuracy: 0.7600 - val_loss: 0.9860 - val_top3_acc: 0.9833 - learning_rate: 1.0000e-04
+    Epoch 5/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4068s[0m 937ms/step - accuracy: 0.7765 - loss: 0.9647 - top3_acc: 0.9831 - val_accuracy: 0.7831 - val_loss: 0.9562 - val_top3_acc: 0.9804 - learning_rate: 1.0000e-04
+    Epoch 6/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4094s[0m 943ms/step - accuracy: 0.8143 - loss: 0.8595 - top3_acc: 0.9870 - val_accuracy: 0.8187 - val_loss: 0.8431 - val_top3_acc: 0.9863 - learning_rate: 1.0000e-04
+    Epoch 7/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4089s[0m 942ms/step - accuracy: 0.8365 - loss: 0.7844 - top3_acc: 0.9893 - val_accuracy: 0.6742 - val_loss: 1.4203 - val_top3_acc: 0.9829 - learning_rate: 1.0000e-04
+    Epoch 8/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4098s[0m 944ms/step - accuracy: 0.8594 - loss: 0.7199 - top3_acc: 0.9917 - val_accuracy: 0.8272 - val_loss: 0.8203 - val_top3_acc: 0.9827 - learning_rate: 1.0000e-04
+    Epoch 9/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4100s[0m 945ms/step - accuracy: 0.8707 - loss: 0.6741 - top3_acc: 0.9929 - val_accuracy: 0.9044 - val_loss: 0.5804 - val_top3_acc: 0.9948 - learning_rate: 1.0000e-04
+    Epoch 10/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4107s[0m 946ms/step - accuracy: 0.8864 - loss: 0.6206 - top3_acc: 0.9941 - val_accuracy: 0.8894 - val_loss: 0.5974 - val_top3_acc: 0.9911 - learning_rate: 1.0000e-04
+    [1m543/543[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m182s[0m 335ms/step
+    
+    === Fold 2/5 ===
+    Epoch 1/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4127s[0m 948ms/step - accuracy: 0.3852 - loss: 2.0375 - top3_acc: 0.8335 - val_accuracy: 0.4894 - val_loss: 1.5925 - val_top3_acc: 0.9351 - learning_rate: 1.0000e-04
+    Epoch 2/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4076s[0m 939ms/step - accuracy: 0.5519 - loss: 1.5418 - top3_acc: 0.9357 - val_accuracy: 0.6308 - val_loss: 1.2930 - val_top3_acc: 0.9653 - learning_rate: 1.0000e-04
+    Epoch 3/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4082s[0m 940ms/step - accuracy: 0.6396 - loss: 1.3092 - top3_acc: 0.9623 - val_accuracy: 0.6656 - val_loss: 1.2914 - val_top3_acc: 0.9712 - learning_rate: 1.0000e-04
+    Epoch 4/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4076s[0m 939ms/step - accuracy: 0.7218 - loss: 1.1077 - top3_acc: 0.9753 - val_accuracy: 0.7337 - val_loss: 1.0855 - val_top3_acc: 0.9768 - learning_rate: 1.0000e-04
+    Epoch 5/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4083s[0m 941ms/step - accuracy: 0.7750 - loss: 0.9672 - top3_acc: 0.9829 - val_accuracy: 0.8140 - val_loss: 0.8456 - val_top3_acc: 0.9887 - learning_rate: 1.0000e-04
+    Epoch 6/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4085s[0m 941ms/step - accuracy: 0.8129 - loss: 0.8596 - top3_acc: 0.9875 - val_accuracy: 0.7914 - val_loss: 0.8975 - val_top3_acc: 0.9865 - learning_rate: 1.0000e-04
+    Epoch 7/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4104s[0m 946ms/step - accuracy: 0.8408 - loss: 0.7758 - top3_acc: 0.9894 - val_accuracy: 0.8317 - val_loss: 0.8594 - val_top3_acc: 0.9823 - learning_rate: 1.0000e-04
+    Epoch 8/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4098s[0m 944ms/step - accuracy: 0.8552 - loss: 0.7220 - top3_acc: 0.9903 - val_accuracy: 0.8464 - val_loss: 0.7447 - val_top3_acc: 0.9890 - learning_rate: 1.0000e-04
+    Epoch 9/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4102s[0m 945ms/step - accuracy: 0.8722 - loss: 0.6657 - top3_acc: 0.9931 - val_accuracy: 0.9054 - val_loss: 0.5634 - val_top3_acc: 0.9947 - learning_rate: 1.0000e-04
+    Epoch 10/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4106s[0m 946ms/step - accuracy: 0.8893 - loss: 0.6153 - top3_acc: 0.9944 - val_accuracy: 0.8725 - val_loss: 0.6463 - val_top3_acc: 0.9940 - learning_rate: 1.0000e-04
+    [1m543/543[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m179s[0m 328ms/step
+    
+    === Fold 3/5 ===
+    Epoch 1/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4253s[0m 977ms/step - accuracy: 0.3779 - loss: 2.0228 - top3_acc: 0.8309 - val_accuracy: 0.5579 - val_loss: 1.4844 - val_top3_acc: 0.9304 - learning_rate: 1.0000e-04
+    Epoch 2/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4310s[0m 993ms/step - accuracy: 0.5563 - loss: 1.5210 - top3_acc: 0.9403 - val_accuracy: 0.5119 - val_loss: 1.6269 - val_top3_acc: 0.9561 - learning_rate: 1.0000e-04
+    Epoch 3/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4315s[0m 994ms/step - accuracy: 0.6423 - loss: 1.3036 - top3_acc: 0.9626 - val_accuracy: 0.7497 - val_loss: 1.0218 - val_top3_acc: 0.9873 - learning_rate: 1.0000e-04
+    Epoch 4/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4333s[0m 998ms/step - accuracy: 0.7264 - loss: 1.0982 - top3_acc: 0.9745 - val_accuracy: 0.7591 - val_loss: 1.1547 - val_top3_acc: 0.9765 - learning_rate: 1.0000e-04
+    Epoch 5/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4219s[0m 972ms/step - accuracy: 0.7796 - loss: 0.9546 - top3_acc: 0.9828 - val_accuracy: 0.8310 - val_loss: 0.8199 - val_top3_acc: 0.9895 - learning_rate: 1.0000e-04
+    Epoch 6/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4501s[0m 1s/step - accuracy: 0.8134 - loss: 0.8527 - top3_acc: 0.9866 - val_accuracy: 0.7725 - val_loss: 1.0078 - val_top3_acc: 0.9814 - learning_rate: 1.0000e-04
+    Epoch 7/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4483s[0m 1s/step - accuracy: 0.8442 - loss: 0.7668 - top3_acc: 0.9888 - val_accuracy: 0.8518 - val_loss: 0.7624 - val_top3_acc: 0.9908 - learning_rate: 1.0000e-04
+    Epoch 8/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4274s[0m 985ms/step - accuracy: 0.8609 - loss: 0.7101 - top3_acc: 0.9912 - val_accuracy: 0.8684 - val_loss: 0.6770 - val_top3_acc: 0.9882 - learning_rate: 1.0000e-04
+    Epoch 9/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4259s[0m 981ms/step - accuracy: 0.8725 - loss: 0.6680 - top3_acc: 0.9918 - val_accuracy: 0.8940 - val_loss: 0.5874 - val_top3_acc: 0.9957 - learning_rate: 1.0000e-04
+    Epoch 10/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4275s[0m 985ms/step - accuracy: 0.8873 - loss: 0.6207 - top3_acc: 0.9934 - val_accuracy: 0.8627 - val_loss: 0.6994 - val_top3_acc: 0.9880 - learning_rate: 1.0000e-04
+    [1m543/543[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m189s[0m 346ms/step
+    
+    === Fold 4/5 ===
+    Epoch 1/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4356s[0m 1s/step - accuracy: 0.3815 - loss: 2.0319 - top3_acc: 0.8380 - val_accuracy: 0.5673 - val_loss: 1.4588 - val_top3_acc: 0.9561 - learning_rate: 1.0000e-04
+    Epoch 2/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4311s[0m 993ms/step - accuracy: 0.5455 - loss: 1.5395 - top3_acc: 0.9376 - val_accuracy: 0.6250 - val_loss: 1.2903 - val_top3_acc: 0.9650 - learning_rate: 1.0000e-04
+    Epoch 3/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4224s[0m 973ms/step - accuracy: 0.6323 - loss: 1.3171 - top3_acc: 0.9625 - val_accuracy: 0.6676 - val_loss: 1.1999 - val_top3_acc: 0.9753 - learning_rate: 1.0000e-04
+    Epoch 4/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4228s[0m 974ms/step - accuracy: 0.7204 - loss: 1.1156 - top3_acc: 0.9760 - val_accuracy: 0.6883 - val_loss: 1.1998 - val_top3_acc: 0.9696 - learning_rate: 1.0000e-04
+    Epoch 5/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4230s[0m 975ms/step - accuracy: 0.7760 - loss: 0.9660 - top3_acc: 0.9825 - val_accuracy: 0.8140 - val_loss: 0.8729 - val_top3_acc: 0.9891 - learning_rate: 1.0000e-04
+    Epoch 6/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4233s[0m 975ms/step - accuracy: 0.8144 - loss: 0.8568 - top3_acc: 0.9863 - val_accuracy: 0.8332 - val_loss: 0.7787 - val_top3_acc: 0.9910 - learning_rate: 1.0000e-04
+    Epoch 7/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4240s[0m 977ms/step - accuracy: 0.8379 - loss: 0.7782 - top3_acc: 0.9902 - val_accuracy: 0.8046 - val_loss: 0.8881 - val_top3_acc: 0.9815 - learning_rate: 1.0000e-04
+    Epoch 8/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4243s[0m 978ms/step - accuracy: 0.8592 - loss: 0.7159 - top3_acc: 0.9903 - val_accuracy: 0.8581 - val_loss: 0.7052 - val_top3_acc: 0.9915 - learning_rate: 1.0000e-04
+    Epoch 9/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4244s[0m 978ms/step - accuracy: 0.8716 - loss: 0.6689 - top3_acc: 0.9924 - val_accuracy: 0.8509 - val_loss: 0.7067 - val_top3_acc: 0.9929 - learning_rate: 1.0000e-04
+    Epoch 10/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4246s[0m 978ms/step - accuracy: 0.8836 - loss: 0.6236 - top3_acc: 0.9940 - val_accuracy: 0.9078 - val_loss: 0.5500 - val_top3_acc: 0.9950 - learning_rate: 1.0000e-04
+    [1m543/543[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m186s[0m 342ms/step
+    
+    === Fold 5/5 ===
+    Epoch 1/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4293s[0m 986ms/step - accuracy: 0.3798 - loss: 2.0439 - top3_acc: 0.8327 - val_accuracy: 0.5816 - val_loss: 1.5028 - val_top3_acc: 0.9465 - learning_rate: 1.0000e-04
+    Epoch 2/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4341s[0m 1s/step - accuracy: 0.5543 - loss: 1.5286 - top3_acc: 0.9386 - val_accuracy: 0.6710 - val_loss: 1.2634 - val_top3_acc: 0.9597 - learning_rate: 1.0000e-04
+    Epoch 3/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4455s[0m 1s/step - accuracy: 0.6517 - loss: 1.2846 - top3_acc: 0.9621 - val_accuracy: 0.6483 - val_loss: 1.3017 - val_top3_acc: 0.9768 - learning_rate: 1.0000e-04
+    Epoch 4/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4453s[0m 1s/step - accuracy: 0.7361 - loss: 1.0773 - top3_acc: 0.9791 - val_accuracy: 0.7133 - val_loss: 1.1247 - val_top3_acc: 0.9793 - learning_rate: 1.0000e-04
+    Epoch 5/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4465s[0m 1s/step - accuracy: 0.7784 - loss: 0.9494 - top3_acc: 0.9844 - val_accuracy: 0.7415 - val_loss: 1.0977 - val_top3_acc: 0.9801 - learning_rate: 1.0000e-04
+    Epoch 6/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4432s[0m 1s/step - accuracy: 0.8157 - loss: 0.8506 - top3_acc: 0.9876 - val_accuracy: 0.8259 - val_loss: 0.8266 - val_top3_acc: 0.9881 - learning_rate: 1.0000e-04
+    Epoch 7/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4258s[0m 981ms/step - accuracy: 0.8414 - loss: 0.7697 - top3_acc: 0.9903 - val_accuracy: 0.8087 - val_loss: 0.8591 - val_top3_acc: 0.9887 - learning_rate: 1.0000e-04
+    Epoch 8/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4255s[0m 980ms/step - accuracy: 0.8568 - loss: 0.7181 - top3_acc: 0.9911 - val_accuracy: 0.8665 - val_loss: 0.6853 - val_top3_acc: 0.9919 - learning_rate: 1.0000e-04
+    Epoch 9/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4247s[0m 979ms/step - accuracy: 0.8716 - loss: 0.6699 - top3_acc: 0.9923 - val_accuracy: 0.8530 - val_loss: 0.7193 - val_top3_acc: 0.9910 - learning_rate: 1.0000e-04
+    Epoch 10/10
+    [1m4340/4340[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4250s[0m 979ms/step - accuracy: 0.8848 - loss: 0.6256 - top3_acc: 0.9937 - val_accuracy: 0.8611 - val_loss: 0.6960 - val_top3_acc: 0.9929 - learning_rate: 1.0000e-04
+    [1m543/543[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m184s[0m 338ms/step
+    
+    === Final Classification Report ===
+                  precision    recall  f1-score   support
+    
+              AD       0.87      0.78      0.82     15982
+             MCI       0.91      0.93      0.92     23726
+            EMCI       0.90      0.93      0.91     30334
+            LMCI       0.88      0.90      0.89     16764
+    
+        accuracy                           0.90     86806
+       macro avg       0.89      0.88      0.89     86806
+    weighted avg       0.90      0.90      0.89     86806
+    
+    
+ 
+
